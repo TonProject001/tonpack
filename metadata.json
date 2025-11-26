@@ -1,0 +1,8 @@
+{
+  "name": "Copy of PackRecord Pro (Dobybot Clone) ต้นOK v2.2",
+  "description": "ลองอัพขึ้นเว็บ",
+  "requestFramePermissions": [
+    "camera",
+    "microphone"
+  ]
+}
