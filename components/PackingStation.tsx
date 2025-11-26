@@ -1,9 +1,8 @@
 import React, { useState, useRef, useEffect, useCallback } from 'react';
-import { Camera, StopCircle, RefreshCw, CheckCircle, ScanLine, Play, Box, CloudUpload, Link as LinkIcon, ExternalLink, AlertTriangle } from 'lucide-react';
+import { Camera, StopCircle, RefreshCw, CheckCircle, ScanLine, Box, VideoOff, Download, AlertTriangle } from 'lucide-react';
 import { RecorderState } from '../types';
 import { db } from '../services/db';
 import { analyzePackageImage } from '../services/geminiService';
-import { uploadVideoToR2, isR2Configured } from '../services/r2Service';
 
 export const PackingStation: React.FC = () => {
   // Logic State
@@ -13,9 +12,7 @@ export const PackingStation: React.FC = () => {
   const [recorderState, setRecorderState] = useState<RecorderState>(RecorderState.IDLE);
   const [duration, setDuration] = useState(0);
   const [lastAnalysis, setLastAnalysis] = useState<string | null>(null);
-  const [uploadProgress, setUploadProgress] = useState(0);
-  const [generatedLink, setGeneratedLink] = useState<string | null>(null);
-  const [uploadError, setUploadError] = useState<string | null>(null);
+  const [cameraError, setCameraError] = useState<string | null>(null);
   
   const videoRef = useRef<HTMLVideoElement>(null);
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
@@ -37,23 +34,50 @@ export const PackingStation: React.FC = () => {
     };
   }, [recorderState]);
 
-  // 2. Camera Initialization & Focus Management
-  useEffect(() => {
-    const startCamera = async () => {
-      try {
-        const stream = await navigator.mediaDevices.getUserMedia({ 
-          // Requested 720p resolution
-          video: { width: { ideal: 1280 }, height: { ideal: 720 } }, 
-          audio: true 
-        });
-        if (videoRef.current) {
-          videoRef.current.srcObject = stream;
+  // 2. Camera Initialization Strategy
+  const startCamera = useCallback(async () => {
+    setCameraError(null);
+    
+    // Cleanup existing stream if any
+    if (videoRef.current && videoRef.current.srcObject) {
+        const stream = videoRef.current.srcObject as MediaStream;
+        stream.getTracks().forEach(track => track.stop());
+    }
+
+    const attempts = [
+        // Plan A: HD Video + Audio
+        { video: { width: { ideal: 1280 }, height: { ideal: 720 } }, audio: true },
+        // Plan B: Standard Video + Audio (if HD fails)
+        { video: true, audio: true },
+        // Plan C: Video Only (if Microphone is missing/blocked)
+        { video: true, audio: false }
+    ];
+
+    for (const constraints of attempts) {
+        try {
+            const stream = await navigator.mediaDevices.getUserMedia(constraints);
+            if (videoRef.current) {
+                videoRef.current.srcObject = stream;
+                setCameraError(null);
+                return; // Success!
+            }
+        } catch (err: any) {
+            console.warn("Camera attempt failed:", constraints, err);
+            
+            // If Permission Denied, stop trying immediately and show instruction
+            if (err.name === 'NotAllowedError' || err.name === 'PermissionDeniedError') {
+                setCameraError("PERMISSION_DENIED");
+                return;
+            }
         }
-      } catch (err) {
-        console.error("Error accessing camera:", err);
-        // Don't alert immediately on load, only log
-      }
-    };
+    }
+
+    // If all attempts fail
+    setCameraError("GENERIC_ERROR");
+  }, []);
+
+  // Initialize camera on mount
+  useEffect(() => {
     startCamera();
 
     const focusInterval = setInterval(() => {
@@ -64,11 +88,18 @@ export const PackingStation: React.FC = () => {
 
     return () => {
       clearInterval(focusInterval);
+      if (videoRef.current && videoRef.current.srcObject) {
+        const stream = videoRef.current.srcObject as MediaStream;
+        stream.getTracks().forEach(track => track.stop());
+      }
     };
-  }, [recorderState]);
+  }, [startCamera]);
 
   const startRecording = useCallback((idToRecord: string) => {
-    if (!videoRef.current?.srcObject) return;
+    if (!videoRef.current?.srcObject) {
+        alert("Camera not ready! Please resolve camera errors first.");
+        return;
+    }
 
     const stream = videoRef.current.srcObject as MediaStream;
     
@@ -78,9 +109,12 @@ export const PackingStation: React.FC = () => {
         videoBitsPerSecond: 1000000 
     };
 
-    const mediaRecorder = MediaRecorder.isTypeSupported(options.mimeType!) 
-        ? new MediaRecorder(stream, options) 
-        : new MediaRecorder(stream);
+    // Fallback for mimeTypes if vp8 is not supported
+    const mimeType = MediaRecorder.isTypeSupported('video/webm;codecs=vp8') 
+        ? 'video/webm;codecs=vp8' 
+        : 'video/webm';
+
+    const mediaRecorder = new MediaRecorder(stream, { ...options, mimeType });
     
     mediaRecorderRef.current = mediaRecorder;
     chunksRef.current = [];
@@ -109,57 +143,36 @@ export const PackingStation: React.FC = () => {
       
       // Capture frame for AI Analysis
       if (videoRef.current) {
-        const canvas = document.createElement('canvas');
-        canvas.width = videoRef.current.videoWidth;
-        canvas.height = videoRef.current.videoHeight;
-        const ctx = canvas.getContext('2d');
-        ctx?.drawImage(videoRef.current, 0, 0);
-        const base64 = canvas.toDataURL('image/jpeg', 0.7).split(',')[1];
-        
-        analyzePackageImage(base64).then(setLastAnalysis);
+        try {
+            const canvas = document.createElement('canvas');
+            canvas.width = videoRef.current.videoWidth;
+            canvas.height = videoRef.current.videoHeight;
+            const ctx = canvas.getContext('2d');
+            ctx?.drawImage(videoRef.current, 0, 0);
+            const base64 = canvas.toDataURL('image/jpeg', 0.7).split(',')[1];
+            
+            analyzePackageImage(base64).then(setLastAnalysis);
+        } catch (e) {
+            console.warn("Could not capture frame for AI:", e);
+        }
       }
     }
   }, []);
 
+  const triggerDownload = (blob: Blob, filename: string) => {
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = filename;
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      URL.revokeObjectURL(url);
+  };
+
   const saveRecord = async (blob: Blob, id: string, finalDuration: number) => {
     try {
-      setRecorderState(RecorderState.UPLOADING);
-      setUploadProgress(0);
-      setUploadError(null);
-      let publicUrl = '';
-      let status: 'completed' | 'failed' = 'completed';
-
-      // 1. R2 Real Upload
-      if (isR2Configured()) {
-          try {
-              publicUrl = await uploadVideoToR2(blob, id, (progress) => {
-                  setUploadProgress(progress);
-              });
-          } catch (err) {
-              console.error("R2 Upload Failed:", err);
-              setUploadError("Cloud upload failed. Saved locally only.");
-              status = 'failed';
-              publicUrl = ''; // No URL if upload failed
-          }
-      } else {
-          // Fallback to simulation if keys are missing
-          console.warn("R2 Keys missing. Simulating upload.");
-          publicUrl = await new Promise((resolve) => {
-             let p = 0;
-             const i = setInterval(() => {
-                 p += 20;
-                 setUploadProgress(p);
-                 if(p >= 100) {
-                     clearInterval(i);
-                     resolve(`https://demo-mode.dobybot-clone.com/v/${id}`);
-                 }
-             }, 200);
-          });
-      }
-
-      setGeneratedLink(publicUrl);
-
-      // 2. Save to Local Database (Mock Server DB)
+      // 1. Save to Local Database (Browser Storage)
       await db.records.add({
         orderId: id,
         timestamp: Date.now(),
@@ -167,8 +180,8 @@ export const PackingStation: React.FC = () => {
         duration: finalDuration, 
         isFlagged: false,
         aiAnalysis: "Processing...",
-        uploadStatus: status,
-        publicUrl: publicUrl
+        uploadStatus: 'completed',
+        publicUrl: '' // No public URL in local mode
       });
       
       setTimeout(async () => {
@@ -177,6 +190,9 @@ export const PackingStation: React.FC = () => {
              await db.records.update(lastRec.id!, { aiAnalysis: lastAnalysis });
          }
       }, 2000);
+
+      // 2. Trigger Auto Download to user's computer
+      triggerDownload(blob, `Order_${id}.webm`);
 
       setRecorderState(RecorderState.COMPLETED);
     } catch (error) {
@@ -191,9 +207,6 @@ export const PackingStation: React.FC = () => {
     setActiveOrderId(null);
     setDuration(0);
     setLastAnalysis(null);
-    setGeneratedLink(null);
-    setUploadProgress(0);
-    setUploadError(null);
     setRecorderState(RecorderState.IDLE);
     setTimeout(() => inputRef.current?.focus(), 100);
   };
@@ -271,71 +284,65 @@ export const PackingStation: React.FC = () => {
       <div className="flex-1 flex gap-4 min-h-0">
         
         {/* Left: Camera Feed */}
-        <div className="flex-1 bg-black rounded-xl overflow-hidden relative shadow-2xl border border-slate-800">
-            <video 
-                ref={videoRef} 
-                autoPlay 
-                muted 
-                className="w-full h-full object-cover"
-            />
+        <div className="flex-1 bg-black rounded-xl overflow-hidden relative shadow-2xl border border-slate-800 flex items-center justify-center">
+            {cameraError ? (
+                <div className="text-center p-8 max-w-md bg-slate-800 rounded-xl border border-red-500/50 shadow-xl">
+                    <VideoOff className="w-16 h-16 text-red-500 mx-auto mb-4" />
+                    <h3 className="text-xl font-bold text-white mb-2">Camera Access Failed</h3>
+                    {cameraError === "PERMISSION_DENIED" ? (
+                        <div className="text-slate-300 text-sm mb-6 space-y-2">
+                            <p>Access was blocked by the browser.</p>
+                            <p className="bg-slate-900 p-2 rounded text-yellow-400">
+                                1. Click the lock icon 🔒 in the address bar.<br/>
+                                2. Toggle "Camera" to <strong>Allow</strong>.<br/>
+                                3. Click "Retry" below.
+                            </p>
+                        </div>
+                    ) : (
+                         <div className="text-slate-300 text-sm mb-6">
+                            <p>Could not start camera source.</p>
+                            <p>Please ensure no other app (Zoom/Teams) is using it.</p>
+                        </div>
+                    )}
+                    
+                    <button 
+                        onClick={() => startCamera()}
+                        className="bg-red-600 hover:bg-red-700 text-white px-6 py-2 rounded-lg font-medium transition-colors flex items-center gap-2 mx-auto"
+                    >
+                        <RefreshCw className="w-4 h-4" /> Retry Camera
+                    </button>
+                </div>
+            ) : (
+                <video 
+                    ref={videoRef} 
+                    autoPlay 
+                    muted 
+                    playsInline
+                    className="w-full h-full object-cover"
+                />
+            )}
             
             {/* Overlay UI: Recording */}
-            {recorderState === RecorderState.RECORDING && (
+            {!cameraError && recorderState === RecorderState.RECORDING && (
                 <div className="absolute top-4 right-4 flex items-center gap-2 bg-red-600/90 text-white px-3 py-1 rounded-full text-sm font-semibold animate-pulse">
                     <div className="w-2 h-2 bg-white rounded-full"></div>
                     REC
                 </div>
             )}
-
-            {/* Overlay UI: Uploading */}
-            {recorderState === RecorderState.UPLOADING && (
-                <div className="absolute inset-0 bg-slate-900/90 backdrop-blur-sm flex flex-col items-center justify-center">
-                    <CloudUpload className="w-16 h-16 text-blue-500 animate-bounce mb-4" />
-                    <h3 className="text-2xl font-bold text-white mb-2">Uploading to Cloud...</h3>
-                    <div className="w-64 bg-slate-700 rounded-full h-2.5 dark:bg-slate-700 mt-2">
-                        <div className="bg-blue-600 h-2.5 rounded-full transition-all duration-200" style={{ width: `${uploadProgress}%` }}></div>
-                    </div>
-                    <p className="text-slate-400 mt-2 font-mono">{uploadProgress}%</p>
-                </div>
-            )}
             
             {/* Overlay UI: Completed */}
             {recorderState === RecorderState.COMPLETED && (
-                <div className="absolute inset-0 bg-slate-900/95 backdrop-blur-sm flex flex-col items-center justify-center animate-in fade-in zoom-in duration-300">
+                <div className="absolute inset-0 bg-slate-900/95 backdrop-blur-sm flex flex-col items-center justify-center animate-in fade-in zoom-in duration-300 z-10">
                     <div className="bg-slate-800 p-8 rounded-2xl border border-slate-700 max-w-lg w-full shadow-2xl">
                         <div className="flex flex-col items-center text-center mb-6">
-                            {uploadError ? (
-                                <AlertTriangle className="w-16 h-16 text-yellow-500 mb-4" />
-                            ) : (
-                                <CheckCircle className="w-16 h-16 text-green-500 mb-4" />
-                            )}
+                            <CheckCircle className="w-16 h-16 text-green-500 mb-4" />
                             
                             <h3 className="text-2xl font-bold text-white">
-                                {uploadError ? "Saved Locally Only" : "Ready to Send!"}
+                                Saved Successfully!
                             </h3>
-                            <p className="text-slate-400">Order <span className="text-white font-mono">{activeOrderId}</span> has been processed.</p>
-                            {uploadError && <p className="text-red-400 text-xs mt-2">{uploadError}</p>}
+                            <p className="text-slate-400">Order <span className="text-white font-mono">{activeOrderId}</span> saved to device.</p>
+                            <p className="text-xs text-slate-500 mt-1">(Check your Downloads folder)</p>
                         </div>
-
-                        {/* Public Link Box (Only if no error) */}
-                        {!uploadError && generatedLink && (
-                            <div className="bg-slate-950 p-4 rounded-lg border border-slate-800 mb-6 flex flex-col gap-2">
-                                <label className="text-xs text-slate-500 uppercase font-semibold flex items-center gap-1">
-                                    <LinkIcon className="w-3 h-3" /> Customer Tracking Link
-                                </label>
-                                <div className="flex items-center gap-2">
-                                    <code className="flex-1 text-blue-400 text-sm truncate font-mono bg-slate-900 p-2 rounded border border-slate-800">
-                                        {generatedLink}
-                                    </code>
-                                    <button 
-                                        onClick={() => {navigator.clipboard.writeText(generatedLink || '')}}
-                                        className="bg-slate-700 hover:bg-slate-600 text-white px-3 py-2 rounded text-xs font-bold transition-colors"
-                                    >
-                                        Copy
-                                    </button>
-                                </div>
-                            </div>
-                        )}
                         
                         {lastAnalysis && (
                             <div className="bg-blue-900/20 p-4 rounded-lg border border-blue-500/20 mb-8">
@@ -381,20 +388,18 @@ export const PackingStation: React.FC = () => {
                 <div className={`p-4 rounded-lg border transition-all ${recorderState === RecorderState.COMPLETED ? 'bg-green-900/20 border-green-500/50' : 'bg-slate-700/30 border-transparent opacity-50'}`}>
                      <div className="flex items-center gap-3 mb-2">
                         <span className="w-6 h-6 rounded-full bg-green-500 flex items-center justify-center text-xs font-bold">3</span>
-                        <span className="font-semibold text-green-100">Finish & Upload</span>
+                        <span className="font-semibold text-green-100">Finish & Download</span>
                     </div>
-                    <p className="text-xs text-slate-400 pl-9">Scan <span className="text-white font-bold">SAME</span> barcode to stop & auto-upload.</p>
+                    <p className="text-xs text-slate-400 pl-9">Scan <span className="text-white font-bold">SAME</span> barcode to stop & auto-download.</p>
                 </div>
             </div>
 
             <div className="mt-auto">
                 <div className="mb-4">
-                     {!isR2Configured() && (
-                         <div className="flex items-start gap-2 text-xs text-yellow-500 bg-yellow-900/20 p-2 rounded border border-yellow-700/50">
-                             <AlertTriangle className="w-4 h-4 shrink-0" />
-                             <span>R2 Keys not found. Using simulation mode.</span>
-                         </div>
-                     )}
+                    <div className="flex items-start gap-2 text-xs text-slate-400 bg-slate-900/50 p-2 rounded border border-slate-700">
+                         <Download className="w-4 h-4 shrink-0 text-slate-500" />
+                         <span>Video auto-saves to your local "Downloads" folder.</span>
+                    </div>
                 </div>
 
                 {recorderState === RecorderState.RECORDING ? (
@@ -409,7 +414,7 @@ export const PackingStation: React.FC = () => {
                         disabled 
                         className="w-full bg-slate-700 text-slate-500 py-4 rounded-xl font-bold flex items-center justify-center gap-2 cursor-not-allowed opacity-50"
                     >
-                        <Play className="w-6 h-6" /> Scan to Start
+                        <AlertTriangle className="w-6 h-6" /> Scan to Start
                     </button>
                 ) : (
                    <button disabled className="w-full bg-slate-700 text-slate-400 py-4 rounded-xl font-bold flex items-center justify-center gap-2 cursor-wait">
